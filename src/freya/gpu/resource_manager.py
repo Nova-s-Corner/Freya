@@ -2,10 +2,41 @@ import json
 import time
 import urllib.error
 import urllib.request
+import os
+import logging
+from pathlib import Path
 
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 COMFYUI_URL = "http://127.0.0.1:8188"
+
+# VRAM threshold configuration (in GB)
+VRAM_THRESHOLD_GB = 2.0
+
+# Log file path for VRAM alerts
+ALERT_LOG_PATH = Path("~/.freya/vram_alerts.log")
+
+
+def setup_logging():
+    """Set up logging for VRAM alerts."""
+    log_path = ALERT_LOG_PATH.expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Clear existing log file
+    if log_path.exists():
+        log_path.unlink()
+    
+    logger = logging.getLogger("vram_alerts")
+    logger.setLevel(logging.WARNING)
+    
+    handler = logging.FileHandler(log_path, mode='w')
+    formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)s | VRAM: %(vram_gb).2f GB | Message: %(message)s'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    
+    return logger
 
 
 class GPUResourceManager:
@@ -31,6 +62,7 @@ class GPUResourceManager:
     ):
         self.ollama_url = ollama_url.rstrip("/")
         self.comfyui_url = comfyui_url.rstrip("/")
+        self.logger = setup_logging()
 
     def _request_json(
         self,
@@ -210,6 +242,83 @@ class GPUResourceManager:
 
         return True
 
+    def _log_alert(self, message):
+        """Write an alert to the log file."""
+        self.logger.warning(message)
+
+    def get_total_vram_used(self):
+        """
+        Calculate total VRAM usage from both Ollama and ComfyUI.
+        
+        Returns:
+            float: Total VRAM used in GB, or 0 if neither is available
+        """
+        vram = 0.0
+        
+        # Check Ollama models
+        if self.ollama_available():
+            models = self.get_ollama_models()
+            for model in models:
+                size_vram = model.get("size_vram", 0)
+                vram += size_vram / (1024 ** 3)  # Convert to GB
+        
+        # Check ComfyUI memory usage
+        if self.comfyui_available():
+            try:
+                stats = self._request_json(
+                    f"{self.comfyui_url}/system_stats"
+                )
+                # ComfyUI provides total VRAM used in GB
+                vram_used = stats.get("vram", {}).get("used", 0)
+                vram += vram_used
+            except Exception:
+                pass
+        
+        return vram
+    
+    def _log_vram_status(self, vram_gb):
+        """Log current VRAM status for monitoring."""
+        threshold_percent = (vram_gb / VRAM_THRESHOLD_GB) * 100 if VRAM_THRESHOLD_GB > 0 else 0
+        self.logger.info(f"VRAM Status: {vram_gb:.2f} GB used ({threshold_percent:.1f}% of threshold)")
+    
+    def monitor_vram(self, interval=5):
+        """
+        Continuously monitor VRAM usage and log alerts when threshold is exceeded.
+        
+        Args:
+            interval (int): Check interval in seconds (default: 5)
+        """
+        self._log_vram_status(0.0)
+        
+        while True:
+            vram_gb = self.get_total_vram_used()
+            self._log_vram_status(vram_gb)
+            
+            # Check if threshold exceeded
+            if vram_gb >= VRAM_THRESHOLD_GB:
+                self._log_alert(
+                    f"⚠️ VRAM THRESHOLD EXCEEDED! "
+                    f"Current usage: {vram_gb:.2f} GB (threshold: {VRAM_THRESHOLD_GB} GB)"
+                )
+            
+            time.sleep(interval)
+    
+    def start_vram_monitoring(self, interval=5):
+        """
+        Start VRAM monitoring in a background thread.
+        
+        Args:
+            interval (int): Check interval in seconds (default: 5)
+        """
+        import threading
+        thread = threading.Thread(
+            target=self.monitor_vram,
+            args=(interval,),
+            daemon=True
+        )
+        thread.start()
+        return thread
+    
     def print_status(self):
         print()
         print("=== Freya GPU Resource Manager ===")
@@ -255,16 +364,18 @@ class GPUResourceManager:
             print("Ollama server: OFFLINE")
 
         if self.comfyui_available():
-            print("ComfyUI server: ONLINE")
-
+            try:
+                stats = self._request_json(
+                    f"{self.comfyui_url}/system_stats"
+                )
+                vram_used = stats.get("vram", {}).get("used", 0)
+                print(f"ComfyUI VRAM used: {vram_used:.2f} GB")
+            except Exception as e:
+                print(f"ComfyUI: Could not fetch stats ({e})")
         else:
             print("ComfyUI server: OFFLINE")
+    
+    def stop_vram_monitoring(self):
+        """Stop any running VRAM monitoring thread."""
+        pass  # Would need to track the thread in a real implementation
 
-        print("==================================")
-        print()
-
-
-if __name__ == "__main__":
-    manager = GPUResourceManager()
-
-    manager.print_status()
